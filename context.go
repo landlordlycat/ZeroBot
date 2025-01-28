@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"unsafe"
 
 	"github.com/wdvxdr1123/ZeroBot/message"
 )
@@ -24,6 +25,11 @@ type Ctx struct {
 // GetMatcher ...
 func (ctx *Ctx) GetMatcher() *Matcher {
 	return ctx.ma
+}
+
+// ExposeCaller as *T, maybe panic if misused
+func ExposeCaller[T any](ctx *Ctx) *T {
+	return (*T)(*(*unsafe.Pointer)(unsafe.Add(unsafe.Pointer(&ctx.caller), unsafe.Sizeof(uintptr(0)))))
 }
 
 // decoder 反射获取的数据
@@ -80,7 +86,7 @@ func (ctx *Ctx) CheckSession() Rule {
 }
 
 // Send 快捷发送消息/合并转发
-func (ctx *Ctx) Send(msg interface{}) message.MessageID {
+func (ctx *Ctx) Send(msg interface{}) message.ID {
 	event := ctx.Event
 	m, ok := msg.(message.Message)
 	if !ok {
@@ -106,18 +112,22 @@ func (ctx *Ctx) Send(msg interface{}) message.MessageID {
 }
 
 // SendChain 快捷发送消息/合并转发-消息链
-func (ctx *Ctx) SendChain(msg ...message.MessageSegment) message.MessageID {
+func (ctx *Ctx) SendChain(msg ...message.Segment) message.ID {
 	return ctx.Send((message.Message)(msg))
 }
 
 // Echo 向自身分发虚拟事件
 func (ctx *Ctx) Echo(response []byte) {
-	evring.processEvent(response, ctx.caller)
+	if BotConfig.RingLen != 0 {
+		evring.processEvent(response, ctx.caller)
+	} else {
+		processEventAsync(response, ctx.caller, BotConfig.MaxProcessTime)
+	}
 }
 
 // FutureEvent ...
-func (ctx *Ctx) FutureEvent(Type string, rule ...Rule) *FutureEvent {
-	return ctx.ma.FutureEvent(Type, rule...)
+func (ctx *Ctx) FutureEvent(typ string, rule ...Rule) *FutureEvent {
+	return ctx.ma.FutureEvent(typ, rule...)
 }
 
 // Get ..

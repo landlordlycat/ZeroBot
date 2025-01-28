@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/RomiChan/websocket"
 	log "github.com/sirupsen/logrus"
@@ -21,16 +23,32 @@ import (
 
 // WSServer ...
 type WSServer struct {
-	Url         string // ws连接地址
+	URL         string // ws连接地址
 	AccessToken string
 	lstn        net.Listener
 	caller      chan *WSSCaller
+
+	json.Unmarshaler
+}
+
+// UnmarshalJSON init WSServer with waitn=16
+func (wss *WSServer) UnmarshalJSON(data []byte) error {
+	type jsoncfg struct {
+		URL         string // ws连接地址
+		AccessToken string
+	}
+	err := json.Unmarshal(data, (*jsoncfg)(unsafe.Pointer(wss)))
+	if err != nil {
+		return err
+	}
+	wss.caller = make(chan *WSSCaller, 16)
+	return nil
 }
 
 // NewWebSocketServer 使用反向WS通信
 func NewWebSocketServer(waitn int, url, accessToken string) *WSServer {
 	return &WSServer{
-		Url:         url,
+		URL:         url,
 		AccessToken: accessToken,
 		caller:      make(chan *WSSCaller, waitn),
 	}
@@ -46,14 +64,14 @@ type WSSCaller struct {
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
+	CheckOrigin: func(_ *http.Request) bool {
 		return true
 	},
 }
 
 // Connect 监听ws服务
 func (wss *WSServer) Connect() {
-	network, address := resolveURI(wss.Url)
+	network, address := resolveURI(wss.URL)
 	uri, err := url.Parse(address)
 	if err == nil && uri.Scheme != "" {
 		address = uri.Host
@@ -114,7 +132,7 @@ func (wss *WSServer) any(w http.ResponseWriter, r *http.Request) {
 	}
 	err = conn.ReadJSON(&rsp)
 	if err != nil {
-		log.Warnf("[wss] 与Websocket服务器 %v 握手时出现错误: %v", wss.Url, err)
+		log.Warnf("[wss] 与Websocket服务器 %v 握手时出现错误: %v", wss.URL, err)
 		return
 	}
 
@@ -123,7 +141,7 @@ func (wss *WSServer) any(w http.ResponseWriter, r *http.Request) {
 		selfID: rsp.SelfID,
 	}
 	zero.APICallers.Store(rsp.SelfID, c) // 添加Caller到 APICaller list...
-	log.Infof("[wss] 连接Websocket服务器: %s 成功, 账号: %d", wss.Url, rsp.SelfID)
+	log.Infof("[wss] 连接Websocket服务器: %s 成功, 账号: %d", wss.URL, rsp.SelfID)
 	wss.caller <- c
 }
 
@@ -176,12 +194,13 @@ func (wssc *WSSCaller) listen(handler func([]byte, zero.APICaller)) {
 				}
 				close(c) // channel only use once
 			}
-		} else {
-			if rsp.Get("meta_event_type").Str != "heartbeat" { // 忽略心跳事件
-				log.Debug("[wss] 接收到事件: ", helper.BytesToString(payload))
-			}
-			handler(payload, wssc)
+			continue
 		}
+		if rsp.Get("meta_event_type").Str == "heartbeat" { // 忽略心跳事件
+			continue
+		}
+		log.Debug("[wss] 接收到事件: ", helper.BytesToString(payload))
+		handler(payload, wssc)
 	}
 }
 
@@ -189,8 +208,8 @@ func (wssc *WSSCaller) nextSeq() uint64 {
 	return atomic.AddUint64(&wssc.seq, 1)
 }
 
-// CallApi 发送ws请求
-func (wssc *WSSCaller) CallApi(req zero.APIRequest) (zero.APIResponse, error) {
+// CallAPI 发送ws请求
+func (wssc *WSSCaller) CallAPI(req zero.APIRequest) (zero.APIResponse, error) {
 	ch := make(chan zero.APIResponse, 1)
 	req.Echo = wssc.nextSeq()
 	wssc.seqMap.Store(req.Echo, ch)

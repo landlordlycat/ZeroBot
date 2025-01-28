@@ -3,7 +3,6 @@ package zero
 import (
 	"encoding/json"
 	"hash/crc64"
-	"math/rand"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -21,21 +20,23 @@ import (
 
 // Config is config of zero bot
 type Config struct {
-	NickName       []string      `json:"nickname"`         // 机器人名称
-	CommandPrefix  string        `json:"command_prefix"`   // 触发命令
-	SuperUsers     []int64       `json:"super_users"`      // 超级用户
-	RingLen        uint          `json:"ring_len"`         // 事件环长度 (默认关闭)
-	Latency        time.Duration `json:"latency"`          // 事件处理延迟 (延迟 latency + (0~100ms) 再处理事件) (默认为0)
-	MaxProcessTime time.Duration `json:"max_process_time"` // 事件最大处理时间 (默认4min)
-	Driver         []Driver      `json:"-"`                // 通信驱动
+	NickName        []string      `json:"nickname"`           // 机器人名称
+	CommandPrefix   string        `json:"command_prefix"`     // 触发命令
+	SuperUsers      []int64       `json:"super_users"`        // 超级用户
+	RingLen         uint          `json:"ring_len"`           // 事件环长度 (默认关闭)
+	Latency         time.Duration `json:"latency"`            // 事件处理延迟 (延迟 latency 再处理事件，在 ring 模式下不可低于 1ms)
+	MaxProcessTime  time.Duration `json:"max_process_time"`   // 事件最大处理时间 (默认4min)
+	MarkMessage     bool          `json:"mark_message"`       // 自动标记消息为已读
+	KeepAtMeMessage bool          `json:"keep_at_me_message"` // 是否保留at me的原始消息
+	Driver          []Driver      `json:"-"`                  // 通信驱动
 }
 
 // APICallers 所有的APICaller列表， 通过self-ID映射
 var APICallers callerMap
 
-// APICaller is the interface of CallApi
+// APICaller is the interface of CallAPI
 type APICaller interface {
-	CallApi(request APIRequest) (APIResponse, error)
+	CallAPI(request APIRequest) (APIResponse, error)
 }
 
 // Driver 与OneBot通信的驱动，使用driver.DefaultWebSocketDriver
@@ -125,23 +126,29 @@ func RunAndBlock(op *Config, preblock func()) {
 }
 
 var (
-	triggeredMessages   = ttl.NewCache[int64, []message.MessageID](time.Minute * 5)
+	triggeredMessages   = ttl.NewCache[int64, []message.ID](time.Minute * 5)
 	triggeredMessagesMu = sync.Mutex{}
 )
 
 type messageLogger struct {
-	msgid  message.MessageID
+	msgid  message.ID
 	caller APICaller
 }
 
-// CallApi 记录被触发的回复消息
-func (m *messageLogger) CallApi(request APIRequest) (rsp APIResponse, err error) {
-	rsp, err = m.caller.CallApi(request)
+// CallAPI 记录被触发的回复消息
+func (m *messageLogger) CallAPI(request APIRequest) (rsp APIResponse, err error) {
+	noLog := false
+	b, ok := request.Params["__zerobot_no_log_mseeage_id__"].(bool)
+	if ok {
+		noLog = b
+		delete(request.Params, "__zerobot_no_log_mseeage_id__")
+	}
+	rsp, err = m.caller.CallAPI(request)
 	if err != nil {
 		return
 	}
 	id := rsp.Data.Get("message_id")
-	if id.Exists() {
+	if id.Exists() && !noLog {
 		mid := m.msgid.ID()
 		triggeredMessagesMu.Lock()
 		defer triggeredMessagesMu.Unlock()
@@ -156,7 +163,7 @@ func (m *messageLogger) CallApi(request APIRequest) (rsp APIResponse, err error)
 }
 
 // GetTriggeredMessages 获取被 id 消息触发的回复消息 id
-func GetTriggeredMessages(id message.MessageID) []message.MessageID {
+func GetTriggeredMessages(id message.ID) []message.ID {
 	triggeredMessagesMu.Lock()
 	defer triggeredMessagesMu.Unlock()
 	return triggeredMessages.Get(id.ID())
@@ -167,7 +174,7 @@ func processEventAsync(response []byte, caller APICaller, maxwait time.Duration)
 	var event Event
 	_ = json.Unmarshal(response, &event)
 	event.RawEvent = gjson.Parse(helper.BytesToString(response))
-	var msgid message.MessageID
+	var msgid message.ID
 	messageID, err := strconv.ParseInt(helper.BytesToString(event.RawMessageID), 10, 64)
 	if err == nil {
 		event.MessageID = messageID
@@ -226,8 +233,11 @@ func processEventAsync(response []byte, caller APICaller, maxwait time.Duration)
 	go match(ctx, matcherListForRanging, maxwait)
 }
 
-// match 延迟 (1~100ms) 再处理事件
+// match 匹配规则，处理事件
 func match(ctx *Ctx, matchers []*Matcher, maxwait time.Duration) {
+	if BotConfig.MarkMessage && ctx.Event.MessageID != nil {
+		ctx.MarkThisMessageAsRead()
+	}
 	gorule := func(rule Rule) <-chan bool {
 		ch := make(chan bool, 1)
 		go func() {
@@ -255,7 +265,6 @@ func match(ctx *Ctx, matchers []*Matcher, maxwait time.Duration) {
 		}()
 		return ch
 	}
-	time.Sleep(time.Duration(rand.Intn(100)+1) * time.Millisecond)
 	t := time.NewTimer(maxwait)
 	defer t.Stop()
 loop:
@@ -316,7 +325,6 @@ loop:
 				}
 				break
 			}
-
 		}
 
 		// mid handler
@@ -393,21 +401,40 @@ loop:
 
 // preprocessMessageEvent 返回信息事件
 func preprocessMessageEvent(e *Event) {
-	e.Message = message.ParseMessage(e.NativeMessage)
+	msgs := message.ParseMessage(e.NativeMessage)
+
+	if len(msgs) > 0 {
+		filtered := make([]message.Segment, 0, len(msgs))
+		// trim space after at and remove empty text segment
+		for i := range msgs {
+			if i < len(msgs)-1 && msgs[i].Type == "at" && msgs[i+1].Type == "text" {
+				msgs[i+1].Data["text"] = strings.TrimLeft(msgs[i+1].Data["text"], " ")
+			}
+			if msgs[i].Type != "text" || msgs[i].Data["text"] != "" {
+				filtered = append(filtered, msgs[i])
+			}
+		}
+		e.Message = filtered
+	}
 
 	processAt := func() { // 处理是否at机器人
 		e.IsToMe = false
+		if len(e.Message) == 0 {
+			return
+		}
 		for i, m := range e.Message {
 			if m.Type == "at" {
 				qq, _ := strconv.ParseInt(m.Data["qq"], 10, 64)
 				if qq == e.SelfID {
 					e.IsToMe = true
-					e.Message = append(e.Message[:i], e.Message[i+1:]...)
+					if !BotConfig.KeepAtMeMessage {
+						e.Message = append(e.Message[:i], e.Message[i+1:]...)
+					}
 					return
 				}
 			}
 		}
-		if e.Message == nil || len(e.Message) == 0 || e.Message[0].Type != "text" {
+		if len(e.Message) == 0 || e.Message[0].Type != "text" {
 			return
 		}
 		first := e.Message[0]
@@ -463,4 +490,20 @@ func RangeBot(iter func(id int64, ctx *Ctx) bool) {
 	APICallers.Range(func(key int64, value APICaller) bool {
 		return iter(key, &Ctx{caller: value})
 	})
+}
+
+// GetFirstSuperUser 在 qqs 中获得 SuperUsers 列表的首个 qq
+//
+// 找不到返回 -1
+func (op *Config) GetFirstSuperUser(qqs ...int64) int64 {
+	m := make(map[int64]struct{}, len(qqs)*4)
+	for _, qq := range qqs {
+		m[qq] = struct{}{}
+	}
+	for _, qq := range op.SuperUsers {
+		if _, ok := m[qq]; ok {
+			return qq
+		}
+	}
+	return -1
 }
